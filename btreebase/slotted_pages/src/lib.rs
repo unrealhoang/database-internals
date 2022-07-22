@@ -1,14 +1,54 @@
+use std::num::NonZeroU64;
+
+use binary_layout::{define_layout, LayoutAs, FieldSliceAccess};
+
 const PAGE_SIZE: usize = 4096; // 4Kb
-const HEADER_SIZE: usize = 32; // 32 bytes
 
 #[derive(Debug, PartialEq)]
-pub struct PageId(usize);
+pub struct PageId(NonZeroU64);
+
+#[derive(Debug, PartialEq)]
+pub struct MaybePageId(u64);
+
+impl LayoutAs<u64> for MaybePageId {
+    fn read(v: u64) -> Self {
+        MaybePageId(v)
+    }
+
+    fn write(v: Self) -> u64 {
+        v.0
+    }
+}
+
+impl MaybePageId {
+    pub fn from_page_id(p: Option<PageId>) -> Self {
+        MaybePageId(p.map(|page_id| page_id.0.get()).unwrap_or(0))
+    }
+
+    pub fn to_page_id(self) -> Option<PageId> {
+        NonZeroU64::new(self.0).map(PageId)
+    }
+}
 
 #[derive(Debug)]
 pub enum PageType {
     KeyPage = 0,
     KeyValuePage = 1,
 }
+
+define_layout!(page_header, LittleEndian, {
+    magic: [u8; 4],
+    lower_offset: u16,
+    upper_offset: u16,
+    overflow_page: MaybePageId as u64,
+    flags: u16,
+});
+const HEADER_SIZE: usize = binary_layout::internal::unwrap_field_size(page_header::SIZE);
+
+define_layout!(page, LittleEndian, {
+    header: page_header::NestedView,
+    body: [u8; PAGE_SIZE - HEADER_SIZE],
+});
 
 /// Datastructure to store a single unit of fixed-size data in disk
 /// Structure:
@@ -27,111 +67,85 @@ pub struct Page {
 }
 
 impl Page {
+    fn header_mut_view(&mut self) -> page_header::View<impl AsRef<[u8]> + AsMut<[u8]> + '_> {
+        let page_view = page::View::new(&mut self.data[..]);
+        let header_view = page_view.into_header();
+
+        header_view
+    }
+
+    fn header_view(&self) -> page_header::View<impl AsRef<[u8]> + '_> {
+        let page_view = page::View::new(&self.data[..]);
+        let header_view = page_view.into_header();
+
+        header_view
+    }
+
+    fn body_mut(&mut self) -> &mut [u8] {
+        page::body::data_mut(&mut self.data[..])
+    }
+
+    fn body(&self) -> &[u8] {
+        page::body::data(&self.data[..])
+    }
+
     fn empty() -> Self {
         let mut s = Self {
             data: [0; PAGE_SIZE],
         };
-        s.write_magic_number();
-        s.write_lower_offset(0);
-        s.write_upper_offset((PAGE_SIZE-HEADER_SIZE) as u16);
-        s.write_overflow_page(None);
-        s.write_flags(0);
+        s.header_mut_view().magic_mut().copy_from_slice(b"PAGE");
+        s.header_mut_view().lower_offset_mut().write(0);
+        s.header_mut_view().upper_offset_mut().write((PAGE_SIZE-HEADER_SIZE) as u16);
+        s.header_mut_view().overflow_page_mut().write(MaybePageId::from_page_id(None));
+        s.header_mut_view().flags_mut().write(0);
         s
     }
 
-    fn write_magic_number(&mut self) {
-        self.data[0..4].copy_from_slice(b"PAGE");
-    }
-
-    fn write_lower_offset(&mut self, offset: u16) {
-        self.data[4..6].copy_from_slice(&offset.to_le_bytes());
-    }
-
-    fn read_lower_offset(&self) -> u16 {
-        u16::from_le_bytes(self.data[4..6].try_into().unwrap())
-    }
-
-    fn write_upper_offset(&mut self, offset: u16) {
-        self.data[6..8].copy_from_slice(&offset.to_le_bytes());
-    }
-
-    fn read_upper_offset(&self) -> u16 {
-        u16::from_le_bytes(self.data[6..8].try_into().unwrap())
-    }
-
-    fn write_overflow_page(&mut self, page: Option<PageId>) {
-        match page {
-            Some(p) => {
-                self.data[8..16].copy_from_slice(&p.0.to_le_bytes())
-            }
-            None => {
-                self.data[8..16].copy_from_slice(&0usize.to_le_bytes())
-            }
-        }
-    }
-
-    fn read_overflow_page(&self) -> Option<PageId> {
-        let pid = usize::from_le_bytes(self.data[8..16].try_into().unwrap());
-        if pid == 0 {
-            None
-        } else {
-            Some(PageId(pid))
-        }
-    }
-
-    fn write_flags(&mut self, offset: u16) {
-        self.data[16..18].copy_from_slice(&offset.to_le_bytes());
-    }
-
-    fn read_flags(&self) -> u16 {
-        u16::from_le_bytes(self.data[16..18].try_into().unwrap())
-    }
-
     fn write_cell_data(&mut self, from_offset: u16, data: &[u8]) {
-        let idx = HEADER_SIZE + from_offset as usize;
+        let idx = from_offset as usize;
         let idx_to = idx + data.len();
-        self.data[idx..idx_to].copy_from_slice(data);
+        self.body_mut()[idx..idx_to].copy_from_slice(data);
     }
 
     fn read_cell(&self, from_offset: u16, len: u16) -> &[u8] {
-        let idx = HEADER_SIZE + from_offset as usize;
+        let idx = from_offset as usize;
         let idx_to = idx + len as usize;
-        &self.data[idx..idx_to]
+        &self.body()[idx..idx_to]
     }
 
     // 1 pointer is 4 bytes
     // 2 for offset and 2 for len
     fn write_pointer(&mut self, from_offset: u16, addr: u16, len: u16) {
-        let idx = HEADER_SIZE + from_offset as usize;
-        self.data[idx..idx + 2].copy_from_slice(&addr.to_le_bytes());
-        self.data[idx + 2..idx + 4].copy_from_slice(&len.to_le_bytes());
+        let idx = from_offset as usize;
+        self.body_mut()[idx..idx + 2].copy_from_slice(&addr.to_le_bytes());
+        self.body_mut()[idx + 2..idx + 4].copy_from_slice(&len.to_le_bytes());
     }
 
     fn read_pointer(&self, from_offset: u16) -> (u16, u16) {
         // if read from non-ptr range
-        if from_offset > self.read_lower_offset() {
+        if from_offset > self.header_view().lower_offset().read() {
             panic!("Not a pointer");
         }
-        let idx = HEADER_SIZE + from_offset as usize;
-        let addr = u16::from_le_bytes(self.data[idx..idx+2].try_into().unwrap());
-        let len = u16::from_le_bytes(self.data[idx+2..idx+4].try_into().unwrap());
+        let idx = from_offset as usize;
+        let addr = u16::from_le_bytes(self.body()[idx..idx+2].try_into().unwrap());
+        let len = u16::from_le_bytes(self.body()[idx+2..idx+4].try_into().unwrap());
 
         (addr, len)
     }
 
     fn add_cell(&mut self, data: &[u8]) {
-        let lower_offset = self.read_lower_offset();
-        let upper_offset = self.read_upper_offset();
+        let lower_offset = self.header_view().lower_offset().read();
+        let upper_offset = self.header_view().upper_offset().read();
         if data.len() > (upper_offset - lower_offset) as usize {
             panic!("Overflow page");
         }
         let addr = upper_offset - data.len() as u16;
         self.write_cell_data(addr, data);
         self.write_pointer(lower_offset, addr as u16, data.len() as u16);
-        let new_lower = lower_offset + 4;
-        let new_upper = addr;
-        self.write_lower_offset(new_lower);
-        self.write_upper_offset(new_upper);
+        let new_lower = lower_offset + 4 as u16;
+        let new_upper = addr as u16;
+        self.header_mut_view().lower_offset_mut().write(new_lower);
+        self.header_mut_view().upper_offset_mut().write(new_upper);
     }
 
     fn read_nth_cell(&self, nth: usize) -> &[u8] {
@@ -141,7 +155,7 @@ impl Page {
     }
 
     fn cells_count(&self) -> u16 {
-        self.read_lower_offset() / 4
+        self.header_view().lower_offset().read() / 4
     }
 }
 
@@ -152,10 +166,10 @@ mod tests {
     #[test]
     fn it_works() {
         let mut page = Page::empty();
-        assert_eq!(page.read_lower_offset(), 0);
-        assert_eq!(page.read_upper_offset(), (PAGE_SIZE - HEADER_SIZE) as u16);
-        assert_eq!(page.read_overflow_page(), None);
-        assert_eq!(page.read_flags(), 0);
+        assert_eq!(page.header_view().lower_offset().read(), 0);
+        assert_eq!(page.header_view().upper_offset().read(), (PAGE_SIZE - HEADER_SIZE) as u16);
+        assert_eq!(page.header_view().overflow_page().read().to_page_id(), None);
+        assert_eq!(page.header_view().flags().read(), 0);
 
         page.add_cell(b"Hello, World");
         page.add_cell(b"Cop");
